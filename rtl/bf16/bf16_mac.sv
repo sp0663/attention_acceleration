@@ -1,78 +1,31 @@
 module bf16_mac (
-    input logic clk,
-    input logic rst_n,
-    input logic clr_acc,
-    input logic valid_in,
-    input logic [15:0] a,
-    input logic [15:0] b,
+    input  logic        clk,
+    input  logic        valid_in,
+    input  logic [15:0] a,
+    input  logic [15:0] b,
+    input  logic [31:0] c,
     output logic [31:0] result,
-    output logic valid_out
+    output logic        valid_out
 );
     logic [31:0] a_fp32, b_fp32;
-    logic [31:0] product;
-    logic product_valid;
-    logic sum_valid;
-    logic [31:0] accumulator;
-    logic [31:0] sum_out;
-    logic [31:0] accum_delay [0:11];
 
     bf16_to_fp32 u_a (.bf16_in(a), .fp32_out(a_fp32));
     bf16_to_fp32 u_b (.bf16_in(b), .fp32_out(b_fp32));
 
-    floating_point_0 fp32_multiplier (
+    floating_point_2 fp32_fma (
         .aclk(clk),
-        .aclken(valid_in),
         .s_axis_a_tvalid(valid_in),
         .s_axis_a_tready(),
         .s_axis_a_tdata(a_fp32),
         .s_axis_b_tvalid(valid_in),
         .s_axis_b_tready(),
         .s_axis_b_tdata(b_fp32),
-        .m_axis_result_tvalid(product_valid),
+        .s_axis_c_tvalid(valid_in),
+        .s_axis_c_tready(),
+        .s_axis_c_tdata(c),
+        .m_axis_result_tvalid(valid_out),
         .m_axis_result_tready(1'b1),
-        .m_axis_result_tdata(product)
+        .m_axis_result_tdata(result)
     );
-
-    // 12-stage delay on accumulator feedback to match adder latency
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            for (int i = 0; i < 12; i++) accum_delay[i] <= 32'b0;
-        end else if (clr_acc) begin
-            for (int i = 0; i < 12; i++) accum_delay[i] <= 32'b0;
-        end else if (product_valid) begin
-            accum_delay[0] <= accumulator;
-            for (int i = 1; i < 12; i++) accum_delay[i] <= accum_delay[i-1];
-        end
-    end
-
-    floating_point_1 fp32_adder (
-        .aclk(clk),
-        .aclken(product_valid),
-        .s_axis_a_tvalid(product_valid),
-        .s_axis_a_tready(),
-        .s_axis_a_tdata(product),
-        .s_axis_b_tvalid(product_valid),
-        .s_axis_b_tready(),
-        .s_axis_b_tdata(accum_delay[11]),
-        .m_axis_result_tvalid(sum_valid),
-        .m_axis_result_tready(1'b1),
-        .m_axis_result_tdata(sum_out)
-    );
-
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            accumulator <= 32'b0;
-            result      <= 32'b0;
-            valid_out   <= 1'b0;
-        end else if (clr_acc) begin
-            accumulator <= 32'b0;
-        end else if (sum_valid) begin
-            accumulator <= sum_out;
-            result      <= sum_out;
-            valid_out   <= 1'b1;
-        end else begin
-            valid_out   <= 1'b0;
-        end
-    end
 
 endmodule
