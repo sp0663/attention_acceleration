@@ -14,6 +14,7 @@ module bf16_mac (
     logic sum_valid;
     logic [31:0] accumulator;
     logic [31:0] sum_out;
+    logic [31:0] accum_delay [0:11];
 
     bf16_to_fp32 u_a (.bf16_in(a), .fp32_out(a_fp32));
     bf16_to_fp32 u_b (.bf16_in(b), .fp32_out(b_fp32));
@@ -32,6 +33,18 @@ module bf16_mac (
         .m_axis_result_tdata(product)
     );
 
+    // 12-stage delay on accumulator feedback to match adder latency
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            for (int i = 0; i < 12; i++) accum_delay[i] <= 32'b0;
+        end else if (clr_acc) begin
+            for (int i = 0; i < 12; i++) accum_delay[i] <= 32'b0;
+        end else if (product_valid) begin
+            accum_delay[0] <= accumulator;
+            for (int i = 1; i < 12; i++) accum_delay[i] <= accum_delay[i-1];
+        end
+    end
+
     floating_point_1 fp32_adder (
         .aclk(clk),
         .aclken(product_valid),
@@ -40,7 +53,7 @@ module bf16_mac (
         .s_axis_a_tdata(product),
         .s_axis_b_tvalid(product_valid),
         .s_axis_b_tready(),
-        .s_axis_b_tdata(accumulator),
+        .s_axis_b_tdata(accum_delay[11]),
         .m_axis_result_tvalid(sum_valid),
         .m_axis_result_tready(1'b1),
         .m_axis_result_tdata(sum_out)
