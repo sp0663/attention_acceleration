@@ -32,12 +32,10 @@ module rmsnorm_sum_sq (
     logic accum_valid [0:15];
     logic [31:0] accumulator [0:15];
     logic [15:0] current_accum;
-    logic [8:0] group_count;      
-    logic all_accum_done;
-    logic [3:0] drain_count;
+    logic [8:0]  group_count;
+    logic [3:0]  drain_count;
     logic drain_active;
 
-    // BF16 to FP32 conversion
     generate
         for (genvar i = 0; i < 16; i++) begin : gen_bf16_to_fp32
             bf16_to_fp32 u_bf16_to_fp32 (
@@ -47,7 +45,6 @@ module rmsnorm_sum_sq (
         end
     endgenerate
 
-    // 16 squarers
     generate
         for (genvar i = 0; i < 16; i++) begin : gen_fp32_multiplier
             floating_point_0 u_fp32_multiplier (
@@ -66,7 +63,6 @@ module rmsnorm_sum_sq (
         end
     endgenerate
 
-    // Stage 1: 16 to 8
     generate
         for (genvar j = 0; j < 8; j++) begin : gen_adder_1
             floating_point_1 u_fp32_adder_1 (
@@ -85,7 +81,6 @@ module rmsnorm_sum_sq (
         end
     endgenerate
 
-    // Stage 2: 8 to 4
     generate
         for (genvar k = 0; k < 4; k++) begin : gen_adder_2
             floating_point_1 u_fp32_adder_2 (
@@ -104,7 +99,6 @@ module rmsnorm_sum_sq (
         end
     endgenerate
 
-    // Stage 3: 4 to 2
     generate
         for (genvar m = 0; m < 2; m++) begin : gen_adder_3
             floating_point_1 u_fp32_adder_3 (
@@ -123,7 +117,6 @@ module rmsnorm_sum_sq (
         end
     endgenerate
 
-    // Stage 4: 2 to 1
     floating_point_1 u_fp32_final_adder (
         .aclk(clk),
         .aclken(1'b1),
@@ -139,7 +132,7 @@ module rmsnorm_sum_sq (
     );
 
     generate
-        for (genvar n = 0; n < 16; n++) begin: gen_accum_adder
+        for (genvar n = 0; n < 16; n++) begin : gen_accum_adder
             floating_point_1 u_fp32_accum_adder (
                 .aclk(clk),
                 .aclken(1'b1),
@@ -156,7 +149,6 @@ module rmsnorm_sum_sq (
         end
     endgenerate
 
-    // Stage 1: 16 to 8
     generate
         for (genvar j = 0; j < 8; j++) begin : gen_accum_adder_1
             floating_point_1 u_fp32_accum_adder_1 (
@@ -175,7 +167,6 @@ module rmsnorm_sum_sq (
         end
     endgenerate
 
-    // Stage 2: 8 to 4
     generate
         for (genvar k = 0; k < 4; k++) begin : gen_accum_adder_2
             floating_point_1 u_fp32_accum_adder_2 (
@@ -194,7 +185,6 @@ module rmsnorm_sum_sq (
         end
     endgenerate
 
-    // Stage 3: 4 to 2
     generate
         for (genvar m = 0; m < 2; m++) begin : gen_accum_adder_3
             floating_point_1 u_fp32_accum_adder_3 (
@@ -213,7 +203,6 @@ module rmsnorm_sum_sq (
         end
     endgenerate
 
-    // Stage 4: 2 to 1
     floating_point_1 u_fp32_final_accum_adder (
         .aclk(clk),
         .aclken(1'b1),
@@ -242,28 +231,11 @@ module rmsnorm_sum_sq (
         for (int i = 0; i < 16; i++) begin
             if (!rst_n) begin
                 accumulator[i] <= 32'b0;
-            end
-            else if (clr) begin
+            end else if (clr) begin
                 accumulator[i] <= 32'b0;
-            end
-            else if (accum_valid[i]) begin
+            end else if (accum_valid[i]) begin
                 accumulator[i] <= accum_out[i];
             end
-            else begin
-                accumulator[i] <= accumulator[i];
-            end
-        end
-    end
-
-    always_ff @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            sum_sq      <= 32'b0;
-            valid_out   <= 1'b0;
-        end else if (final_accum_sum_valid) begin
-            sum_sq      <= final_accum_sum;
-            valid_out   <= 1'b1;
-        end else begin
-            valid_out   <= 1'b0;
         end
     end
 
@@ -279,25 +251,42 @@ module rmsnorm_sum_sq (
 
     always_ff @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            drain_active <= 1'b0;
-            drain_count  <= 4'b0;
-            accum_delay_valid <= 1'b0;
+            drain_active      <= 1'b0;
+            drain_count       <= 4'b0;
+            accum_delay_valid <= '{default: 1'b0};
         end else if (clr) begin
-            drain_active <= 1'b0;
-            drain_count  <= 4'b0;
-            accum_delay_valid <= 1'b0;
+            drain_active      <= 1'b0;
+            drain_count       <= 4'b0;
+            accum_delay_valid <= '{default: 1'b0};
         end else if (group_count == 9'd256 && !drain_active) begin
-            drain_active <= 1'b1;
-            drain_count  <= 4'b0;
+            drain_active      <= 1'b1;
+            drain_count       <= 4'b0;
+            accum_delay_valid <= '{default: 1'b0};
         end else if (drain_active) begin
-            if (drain_count == 4'd11) begin   // wait one adder latency (12 cycles) for last accum to settle
+            if (drain_count == 4'd11) begin
                 for (int i = 0; i < 16; i++) accum_delay_valid[i] <= 1'b1;
                 drain_active <= 1'b0;
             end else begin
-                drain_count <= drain_count + 1'b1;
+                drain_count       <= drain_count + 1'b1;
+                accum_delay_valid <= '{default: 1'b0};
             end
         end else begin
-            accum_delay_valid <= 1'b0;
+            accum_delay_valid <= '{default: 1'b0};
+        end
+    end
+
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            sum_sq    <= 32'b0;
+            valid_out <= 1'b0;
+        end else if (clr) begin
+            sum_sq    <= 32'b0;
+            valid_out <= 1'b0;
+        end else if (final_accum_sum_valid) begin
+            sum_sq    <= final_accum_sum;
+            valid_out <= 1'b1;
+        end else begin
+            valid_out <= 1'b0;
         end
     end
 
