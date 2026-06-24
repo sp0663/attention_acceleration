@@ -2,9 +2,9 @@
 
 SystemVerilog implementation of the LLaMA 3 8B attention sublayer for FPGA.  
 All arithmetic is FP32 internally. BF16 conversion happens at the top-level I/O boundary only.  
-Target sequence length: 128 tokens (scalable to 512).
+Target sequence length: 128 tokens, processed **one token at a time** — full sequence lives in off-chip DRAM.
 
----
+\---
 
 ## Directory Structure
 
@@ -16,139 +16,167 @@ rtl/
 ├── projection/
 ├── rope/
 ├── gqa/
-├── attention_engine/
+├── attention\_engine/
 └── memory/
 ```
 
----
+\---
 
 ## top/
 
-### `attention_top.sv`
+### `attention\_top.sv`
+
 Top-level wrapper that instantiates and connects every submodule. Handles BF16→FP32 conversion on input and FP32→BF16 on output. This is the only file the synthesis tool sees at the top level.
 
-### `attention_fsm.sv`
+### `attention\_fsm.sv`
+
 Central finite state machine that sequences the entire datapath. Controls start/done handshakes between blocks, triggers DMA transfers for weight loading, and stalls upstream blocks when downstream buffers are full. All inter-block timing runs through here.
 
----
+\---
 
 ## bf16/
 
-### `bf16_to_fp32.sv`
+### `bf16\_to\_fp32.sv`
+
 Converts a 16-bit BF16 value to 32-bit FP32 by zero-extending the mantissa. Since BF16 is just FP32 with the bottom 16 mantissa bits dropped, this is a simple bit-extension with no arithmetic. Used at the input boundary.
 
-### `fp32_to_bf16.sv`
-Converts FP32 back to BF16 by truncating the lower 16 mantissa bits with round-to-nearest. Used at the output boundary.
+### `fp32\_to\_bf16.sv`
 
-### `bf16_mac.sv`
-Multiply-accumulate unit operating on BF16 inputs. Converts operands to FP32, performs the MAC in FP32, and returns an FP32 accumulator. Used inside the systolic array processing elements.
+Converts FP32 back to BF16 by truncating the lower 16 mantissa bits with round-to-nearest (ties-to-even). Used at the output boundary.
 
----
+### `bf16\_mac.sv`
+
+Fused Multiply-Add (FMA) unit implemented using the Xilinx Floating Point IP core configured as multiply-accumulate. Takes two BF16 inputs (a, b) and one FP32 input (c), converts a and b to FP32 internally, and computes (a×b)+c in a single pipelined operation with 17 cycle latency. No internal accumulator — the caller (systolic PE) is responsible for chaining the c input. Used inside the systolic array processing elements.
+
+\---
 
 ## rmsnorm/
 
-### `rmsnorm_sum_sq.sv`
-Takes a vector of FP32 values of length 4096 and computes the sum of squares across all elements. Implemented as a pipelined adder tree for throughput.
+### `rmsnorm\_sum\_sq.sv`
 
-### `rmsnorm_rsqrt.sv`
-Computes the reciprocal square root (1/√x) of the sum-of-squares output. Uses a LUT-based approximation followed by one Newton-Raphson refinement step for accuracy.
+Takes 16 BF16 values per cycle over 256 cycles (4096 total elements of one token vector) and computes the sum of squares. Implemented as 16 parallel FP32 squarers feeding a 4-stage adder tree (16→1 partial sum per cycle), followed by 16 parallel accumulators in a round-robin scheme to avoid the adder feedback latency problem. A second 4-stage combine tree reduces the 16 partial accumulators to one final FP32 scalar. Outputs one sum\_sq value per token vector.
 
-### `rmsnorm_top.sv`
-Combines the above two modules. Takes the raw input vector, computes RMS, divides each element by it, then multiplies element-wise by the learned gamma vector loaded from weight buffer. Outputs a normalised FP32 vector of the same shape.
+### `rmsnorm\_rsqrt.sv`
 
----
+Computes the reciprocal square root (1/√x) using the Xilinx Floating Point IP core configured as Reciprocal Square Root, single precision FP32. Latency is 33 cycles. Input is sum\_sq/4096 (division by 4096 is a free exponent subtraction of 12 in hardware). Outputs one FP32 scalar per token vector.
+
+### `rmsnorm\_top.sv`
+
+Connects rmsnorm\_sum\_sq and rmsnorm\_rsqrt, then applies the learned gamma scaling. The FSM times gamma streaming to arrive exactly when rsqrt is ready (Option iii — overlapped), eliminating the need to buffer gamma on-chip. Scaling is two stages of 16 parallel FP32 multipliers: first x\[i]×gamma\[i], then result×rsqrt. Outputs 16 normalised BF16 values per cycle.
+
+\---
 
 ## projection/
 
-### `systolic_pe.sv`
-A single processing element (PE) for the systolic array. On each clock cycle it multiplies its local weight value by the incoming activation, accumulates into a local register, and passes the activation to the next PE. The fundamental compute unit.
+### `systolic\_pe.sv`
 
-### `systolic_array.sv`
-An N×N array of systolic PEs for matrix multiplication. Weights are preloaded into the array, activations flow left-to-right, and partial sums accumulate vertically. Parameterised by array size — set N based on available DSP count.
+A single processing element (PE) for the systolic array. Takes BF16 activation a\_in, BF16 weight b\_in, and FP32 partial sum c\_in, computes (a×b)+c using one instantiation of bf16\_mac (Xilinx FMA core), and outputs the FP32 result. Also passes a\_in and b\_in to neighbouring PEs as registered outputs (a\_out, b\_out) so data flows through the array. No internal accumulator — partial sums flow through the c input chain.
 
-### `projection_top.sv`
-Drives the systolic array to compute all four projections in sequence: W_Q, W_K, W_V (during the forward pass), and W_O (after the attention engine). Manages weight DMA requests to load each matrix from DRAM into the array, and routes outputs to the appropriate downstream buffer.
+### `systolic\_array.sv`
 
----
+An N×N array of systolic PEs (N=16, parameterised). Activations flow left-to-right, weights flow top-to-bottom, partial sums accumulate along each row via the c input chain. Input skewing registers ensure a\[i] and b\[j] arrive at PE\[i,j] at the correct cycle. The rightmost PE in each row outputs the dot product result for that row. Tiling over the full 4096-dimension is handled externally by projection\_top.sv.
+
+### `projection\_top.sv`
+
+Drives the systolic array to compute all four projections in sequence: W\_Q, W\_K, W\_V, and W\_O. Manages weight DMA requests to stream 16×16 weight tiles from DRAM into the array, handles tiling over the full 4096×4096 matrix, and routes outputs to the appropriate downstream buffer. One token vector is processed at a time.
+
+\---
 
 ## rope/
 
-### `rope_lut.sv`
-Stores precomputed sin and cos values for all (position, frequency) pairs needed across the full sequence length and head dimension. Addressed by token position and dimension index. Read-only after initialisation.
+### `rope\_lut.sv`
 
-### `rope_rotate.sv`
-Applies a 2D rotation to one pair of dimensions [x1, x2] given sin and cos values from the LUT. Computes [x1·cos − x2·sin, x1·sin + x2·cos]. Fully pipelined, processes one pair per cycle.
+Stores precomputed sin and cos values for all (position, frequency) pairs needed across the full sequence length and head dimension. Addressed by token position and dimension pair index. Read-only after initialisation. Note: if BRAM is insufficient, replace with on-the-fly CORDIC computation in a future revision.
 
-### `rope_top.sv`
-Iterates over all heads and all positions, dispatching pairs of Q and K dimensions to `rope_rotate.sv` with the correct sin/cos from the LUT. V vectors are passed through unchanged. Outputs rotated Q and K tensors of the same shape.
+### `rope\_rotate.sv`
 
----
+Applies a 2D rotation to one pair of dimensions \[x1, x2] given sin and cos values. Computes \[x1·cos − x2·sin, x1·sin + x2·cos] using four FP32 multipliers and two FP32 adders, fully pipelined. Processes one dimension pair per cycle.
+
+### `rope\_top.sv`
+
+Iterates over all heads and all dimension pairs, dispatching Q and K values to rope\_rotate.sv with the correct sin/cos values from rope\_lut.sv. V vectors are passed through unchanged. Outputs rotated Q and K with the same shape as input.
+
+\---
 
 ## gqa/
 
-### `gqa_expand.sv`
-Broadcasts the 8 KV heads to 32 heads by repeating each head 4 times. Implemented as an index remapping — no data is physically copied. A read address into the 8-head KV buffer is computed as `head_index / 4`, so all four Q heads in a group read from the same KV head. Zero additional memory cost.
+### `gqa\_expand.sv`
 
----
+Broadcasts the 8 KV heads to 32 heads by index remapping — no data is physically copied. Read address into the KV buffer is computed as head\_index/4, so all four Q heads in a group read from the same KV head. Zero additional memory or compute cost.
 
-## attention_engine/
+\---
 
-### `dot_product.sv`
-Computes the scaled dot product between one query vector and one key vector: Q·K^T / √128. Takes two FP32 vectors of length 128 (one head dimension) and returns a single FP32 scalar. Implemented as a pipelined multiply-accumulate chain followed by a fixed scale factor.
+## attention\_engine/
 
-### `causal_mask.sv`
-Applies the causal mask to the attention score matrix. For each score at position (i, j), if j > i the score is replaced with −∞ (represented as a large negative FP32 value). Implemented as a comparator and mux — no arithmetic.
+### `dot\_product.sv`
+
+Computes the scaled dot product between one query vector and one key vector: Q·Kᵀ/√128. Takes two FP32 vectors of length 128 (one head dimension) and returns a single FP32 scalar. Implemented as 16 parallel bf16\_mac FMA units feeding a 4-stage adder tree, followed by multiplication by 1/√128 as a fixed scale factor.
+
+### `causal\_mask.sv`
+
+Applies the causal mask to attention scores. For each score at position (i, j), if j > i the score is replaced with a large negative FP32 value (−∞ approximation). Implemented as a comparator and mux — no arithmetic, zero latency.
 
 ### `softmax.sv`
-Row-wise softmax over the attention score matrix. First finds the row maximum for numerical stability, subtracts it from all scores, then exponentiates via a LUT, accumulates the sum using an adder tree, and divides each exp value by the sum. Outputs FP32 attention weights that sum to 1 per row.
 
-### `score_buffer.sv`
-On-chip BRAM tile that stores the attention score matrix [32 heads × S × S] between the dot product stage and the softmax stage. Sized for S ≤ 128. Acts as a ping-pong buffer so the dot product engine and softmax engine can overlap.
+Row-wise softmax over the attention score matrix. Finds the row maximum for numerical stability, subtracts it from all scores, exponentiates using the Xilinx FP exp() IP core, accumulates the sum using an adder tree, then divides each exp value by the sum. Outputs FP32 attention weights that sum to 1 per row.
 
-### `attention_engine_top.sv`
-Orchestrates steps 5, 6, and 7. Drives `dot_product.sv` across all head/position pairs to fill `score_buffer.sv`, then passes scores through `causal_mask.sv` and `softmax.sv` to get attention weights, then multiplies weights by V to produce the attended output. Controls all internal sequencing.
+### `score\_buffer.sv`
 
----
+On-chip buffer storing attention scores for one head, one row at a time. Scores are computed one head at a time and passed immediately to softmax — the full \[32 × S × S] matrix is never materialised on-chip. Acts as a small FIFO between the dot product engine and softmax.
+
+### `attention\_engine\_top.sv`
+
+Orchestrates steps 5, 6, and 7. Drives dot\_product.sv across all head and position pairs, passes scores through causal\_mask.sv and softmax.sv, then multiplies attention weights by V to produce the attended output. Processes one head at a time to stay within BRAM budget.
+
+\---
 
 ## memory/
 
-### `axi_master.sv`
-AXI4 bus master that fetches weight matrices from off-chip DRAM on demand. Accepts a base address and burst length from the FSM, performs the AXI read transaction, and streams data into the weight buffer. Handles AXI handshaking, burst splitting, and error responses.
+### `axi\_master.sv`
 
-### `weight_buffer.sv`
-Ping-pong on-chip buffer (two banks of URAM/BRAM) that holds incoming weight tiles streamed from DRAM. While one bank is being consumed by the systolic array, the other is being filled by the AXI master. Prevents stalls due to DRAM latency.
+AXI4 bus master that fetches weight matrices and token vectors from off-chip DRAM on demand. Accepts a base address and burst length from the FSM, performs the AXI read transaction, and streams data into the appropriate on-chip buffer. Handles AXI handshaking, burst splitting, and error responses.
 
-### `token_buffer.sv`
-On-chip BRAM holding the input hidden state tensor [S × 4096] in FP32. Written once at the start of each attention call and read by RMSNorm. Also stores the original pre-norm input for the residual addition in step 9.
+### `weight\_buffer.sv`
 
-### `output_buffer.sv`
-On-chip BRAM holding the final attention output [S × 4096] in FP32 after the residual add. The top-level module reads from here, converts to BF16, and sends the result off-chip via the AXI master.
+Ping-pong on-chip buffer (two banks of BRAM) holding incoming 16×16 weight tiles streamed from DRAM. While one bank is consumed by the systolic array, the other is filled by the AXI master. Prevents stalls due to DRAM latency. Sized for one 16×16 BF16 tile per bank = 8KB total.
 
----
+### `token\_buffer.sv`
 
-## Parameters (defined in `attention_top.sv`)
+On-chip BRAM holding **one token vector \[4096] in BF16** — 8KB, fits in one BRAM18. Written by the AXI master at the start of each token's computation and read by RMSNorm and the residual add. The full sequence of 128 tokens lives in off-chip DRAM and is streamed one token at a time.
 
-| Parameter | Value | Description |
-|---|---|---|
-| `SEQ_LEN` | 128 | Sequence length (scalable to 512) |
-| `D_MODEL` | 4096 | Hidden dimension |
-| `N_HEADS` | 32 | Query heads |
-| `N_KV_HEADS` | 8 | Key/Value heads (GQA) |
-| `HEAD_DIM` | 128 | Per-head dimension (D_MODEL / N_HEADS) |
-| `PE_SIZE` | TBD | Systolic array dimension (set per DSP budget) |
+### `output\_buffer.sv`
 
----
+On-chip BRAM holding one output token vector \[4096] in BF16 after the residual add and BF16 conversion. Written by the attention datapath and read by the AXI master which writes it back to off-chip DRAM immediately. Sized at 8KB — one token at a time.
+
+\---
+
+## Parameters (defined in `attention\_top.sv`)
+
+|Parameter|Value|Description|
+|-|-|-|
+|`SEQ\_LEN`|128|Sequence length (processed one token at a time from DRAM)|
+|`D\_MODEL`|4096|Hidden dimension|
+|`N\_HEADS`|32|Query heads|
+|`N\_KV\_HEADS`|8|Key/Value heads (GQA)|
+|`HEAD\_DIM`|128|Per-head dimension (D\_MODEL / N\_HEADS)|
+|`N\_PARALLEL`|16|Number of parallel lanes (squarers, multipliers, PE rows)|
+|`PE\_SIZE`|16|Systolic array dimension|
+
+\---
 
 ## Interfaces
 
 Every module follows the same valid/ready handshake:
 
-```
-input  logic        clk, rst_n
-input  logic        valid_in
-output logic        ready_in
-output logic        valid_out
-input  logic        ready_out
+```systemverilog
+input  logic  clk, rst\_n
+input  logic  valid\_in
+output logic  ready\_in
+output logic  valid\_out
+input  logic  ready\_out
 ```
 
-A transfer occurs on any cycle where both `valid` and `ready` are high. This allows any module to stall its upstream by deasserting `ready_in`.
+A transfer occurs on any cycle where both `valid` and `ready` are high. This allows any module to stall its upstream by deasserting `ready\_in`.
+
+## 
+

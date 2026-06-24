@@ -1,11 +1,11 @@
 module bf16_mac (
-    input  logic        clk,
-    input  logic        valid_in,
+    input  logic clk,
+    input  logic valid_in,
     input  logic [15:0] a,
     input  logic [15:0] b,
     input  logic [31:0] c,
     output logic [31:0] result,
-    output logic        valid_out
+    output logic valid_out
 );
     logic [31:0] a_fp32, b_fp32;
 
