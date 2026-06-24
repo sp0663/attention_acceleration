@@ -218,6 +218,7 @@ module rmsnorm_sum_sq (
     );
 
     always_ff @(posedge clk or negedge rst_n) begin
+        
         if (!rst_n) begin
             current_accum <= 16'b1;
         end else if (clr) begin
