@@ -26,8 +26,6 @@ module fp32_to_bf16 (
                 if (kept_bit == 1) begin
                     bf16_out = {fp32_in[31], (fp32_in[30:16] + 1'b1)};
                 end else begin
-                    bf16_out = {fp32_in[31:16]};
-                end else begin
                     bf16_out = fp32_in[31:16];
                 end
             end
