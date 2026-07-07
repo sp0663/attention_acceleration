@@ -31,5 +31,5 @@ module fp32_to_bf16 (
             end
         end
     end
-
+    
 endmodule
