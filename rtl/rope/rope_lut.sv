@@ -1,5 +1,3 @@
-`timescale 1ns / 1ps
-
 module rope_lut #(
     // Dimensions based on your Python generation script
     parameter int SEQ_LEN    = 128,

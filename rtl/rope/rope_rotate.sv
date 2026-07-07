@@ -1,5 +1,3 @@
-`timescale 1ns / 1ps
-
 module rope_rotate #(
     parameter int HEAD_DIM  = 128,
     parameter int NUM_PAIRS = HEAD_DIM / 2,
